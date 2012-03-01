@@ -108,7 +108,8 @@ nsOggReader::nsOggReader(nsBuiltinDecoder* aDecoder)
     mSkeletonState(nsnull),
     mVorbisSerial(0),
     mTheoraSerial(0),
-    mPageOffset(0)
+    mPageOffset(0),
+    skippages(0)
 {
   MOZ_COUNT_CTOR(nsOggReader);
   memset(&mTheoraInfo, 0, sizeof(mTheoraInfo));
@@ -345,6 +346,9 @@ nsresult nsOggReader::ReadMetadata(nsVideoInfo* aInfo)
 nsresult nsOggReader::DecodeVorbis(ogg_packet* aPacket) {
   NS_ASSERTION(aPacket->granulepos != -1, "Must know vorbis granulepos!");
 
+  static int runcount = 0;
+  printf("vorbis decode runcount %d\n", runcount++);
+
   if (vorbis_synthesis(&mVorbisState->mBlock, aPacket) != 0) {
     return NS_ERROR_FAILURE;
   }
@@ -389,6 +393,9 @@ bool nsOggReader::DecodeAudioData()
   NS_ASSERTION(mDecoder->OnDecodeThread(), "Should be on decode thread.");
   NS_ASSERTION(mVorbisState!=0, "Need Vorbis state to decode audio");
 
+  static int runcount = 0;
+  printf("DecodeAudioData runcount %d\n", runcount++);
+
   // Read the next data packet. Skip any non-data packets we encounter.
   ogg_packet* packet = 0;
   do {
@@ -398,6 +405,7 @@ bool nsOggReader::DecodeAudioData()
     packet = NextOggPacket(mVorbisState);
   } while (packet && mVorbisState->IsHeader(packet));
   if (!packet) {
+    printf("we ended vorbis logical stream maudioqueue because no packet!\n");
     mAudioQueue.Finish();
     return false;
   }
@@ -410,8 +418,12 @@ bool nsOggReader::DecodeAudioData()
     // We've encountered an end of bitstream packet, or we've hit the end of
     // file while trying to decode, so inform the audio queue that there'll
     // be no more samples.
-    mAudioQueue.Finish();
-    return false;
+    printf("its the end of a vorbis logical stream!\n");
+    if (NS_FAILED(ResetDecode())) {
+      return false;
+    }
+    //mAudioQueue.Finish();
+    //return false;
   }
 
   return true;
@@ -536,22 +548,48 @@ PRInt64 nsOggReader::ReadOggPage(ogg_page* aPage)
 {
   NS_ASSERTION(mDecoder->OnDecodeThread(), "Should be on decode thread.");
 
+  PRUint32 bytesRead = 0;
+  char* buffer = NULL;
   int ret = 0;
+
+  static int kludge = 0;
+  static char kludgebuffer[4096];
+  static int runcount = 0;
+
+  static PRUint32 lastoggserial = 0;
+
+  runcount++;
+  
+  printf("read ogg page run %d\n", runcount);
+
+  if (kludge) {
+  
+    printf("kludged over is %d\n", kludge);
+    ogg_sync_reset(&mOggState);
+    
+    // reinput buffer
+    char* buffer2 = ogg_sync_buffer(&mOggState, 4096);
+    memcpy (buffer2, kludgebuffer, kludge);
+    ret = ogg_sync_wrote(&mOggState, kludge);
+    NS_ENSURE_TRUE(ret == 0, -1);
+  
+    kludge = 0;
+  }
+
   while((ret = ogg_sync_pageseek(&mOggState, aPage)) <= 0) {
     if (ret < 0) {
       // Lost page sync, have to skip up to next page.
+      printf("lost page sync\n");
       mPageOffset += -ret;
       continue;
     }
     // Returns a buffer that can be written too
     // with the given size. This buffer is stored
     // in the ogg synchronisation structure.
-    char* buffer = ogg_sync_buffer(&mOggState, 4096);
+    buffer = ogg_sync_buffer(&mOggState, 4096);
     NS_ASSERTION(buffer, "ogg_sync_buffer failed");
 
     // Read from the stream into the buffer
-    PRUint32 bytesRead = 0;
-
     nsresult rv = mDecoder->GetCurrentStream()->Read(buffer, 4096, &bytesRead);
     if (NS_FAILED(rv) || (bytesRead == 0 && ret == 0)) {
       // End of file.
@@ -564,6 +602,40 @@ PRInt64 nsOggReader::ReadOggPage(ogg_page* aPage)
     ret = ogg_sync_wrote(&mOggState, bytesRead);
     NS_ENSURE_TRUE(ret == 0, -1);    
   }
+  
+  if (ogg_page_eos(aPage) > 0) {
+    printf("its the end of a logical bitstream %d %u\n", runcount, mVorbisSerial);
+    kludge = bytesRead;
+    memcpy (kludgebuffer, buffer, kludge);
+    printf("kludge copy is %d\n", kludge);
+  } else {
+    //printf("its not the end of a logical bitstream\n");
+  }
+  
+  if (ogg_page_bos(aPage) > 0) {
+    mVorbisSerial = ogg_page_serialno(aPage);
+    printf("its the begining of a logical bitstream %d %u\n", runcount, mVorbisSerial);
+     if (mVorbisState) {
+       nsOggCodecState* codecState = 0;
+       mCodecStates.Get(lastoggserial, &codecState);
+       
+      // printf("removinging %u\n", lastoggserial);
+     //  mCodecStates.Remove(lastoggserial);
+       
+       DebugOnly<bool> r = mCodecStates.Put(mVorbisSerial, codecState);
+       NS_ASSERTION(r, "Failed to insert into mCodecStates");
+       printf("did set vorbis state serial %u\n", mVorbisSerial);
+       mVorbisState->mSerial = mVorbisSerial;
+       ogg_stream_reset_serialno(&mVorbisState->mState, mVorbisState->mSerial);
+       skippages = 2;
+     }
+  } else {
+    //printf("its not the end of a logical bitstream\n");
+  }
+  
+  
+  lastoggserial = ogg_page_serialno(aPage);
+  
   PRInt64 offset = mPageOffset;
   mPageOffset += aPage->header_len + aPage->body_len;
   
@@ -573,6 +645,10 @@ PRInt64 nsOggReader::ReadOggPage(ogg_page* aPage)
 ogg_packet* nsOggReader::NextOggPacket(nsOggCodecState* aCodecState)
 {
   NS_ASSERTION(mDecoder->OnDecodeThread(), "Should be on decode thread.");
+
+  static int runcount = 0;
+  printf("nsOggReader NextOggPacket runcount %d\n", runcount++);
+
 
   if (!aCodecState || !aCodecState->mActive) {
     return nsnull;
@@ -586,13 +662,29 @@ ogg_packet* nsOggReader::NextOggPacket(nsOggCodecState* aCodecState)
     if (ReadOggPage(&page) == -1) {
       return nsnull;
     }
+    
+    while (skippages) {
+      if (ReadOggPage(&page) == -1) {
+        return nsnull;
+      }
+      skippages--;
+    }
 
     PRUint32 serial = ogg_page_serialno(&page);
     nsOggCodecState* codecState = nsnull;
     mCodecStates.Get(serial, &codecState);
     if (codecState && NS_FAILED(codecState->PageIn(&page))) {
+      printf("could not put in page\n");
+      if (codecState == nsnull) {
+        printf("because we did not get a codec state!\n");
+      }
       return nsnull;
     }
+    
+    if (codecState == nsnull) {
+      printf("did not find codec state!\n");
+    }
+    
   }
 
   return packet;

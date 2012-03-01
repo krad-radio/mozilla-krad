@@ -162,6 +162,10 @@ ogg_packet* nsOggCodecState::PacketOut() {
 }
 
 nsresult nsOggCodecState::PageIn(ogg_page* aPage) {
+
+  static int runcount = 0;
+  printf("nsOggCodecState  PageIn runcount %d\n", runcount++);
+
   if (!mActive)
     return NS_OK;
   NS_ASSERTION(static_cast<PRUint32>(ogg_page_serialno(aPage)) == mSerial,
@@ -618,16 +622,25 @@ nsVorbisState::IsHeader(ogg_packet* aPacket)
 nsresult
 nsVorbisState::PageIn(ogg_page* aPage)
 {
+
+
+  static int runcount = 0;
+  printf("nsVorbisState  PageIn runcount %d\n", runcount++);
+
   if (!mActive)
     return NS_OK;
   NS_ASSERTION(static_cast<PRUint32>(ogg_page_serialno(aPage)) == mSerial,
                "Page must be for this stream!");
-  if (ogg_stream_pagein(&mState, aPage) == -1)
+  if (ogg_stream_pagein(&mState, aPage) == -1) {
+    printf("failed herey\n");
     return NS_ERROR_FAILURE;
+  }
   bool foundGp;
   nsresult res = PacketOutUntilGranulepos(foundGp);
-  if (NS_FAILED(res))
+  if (NS_FAILED(res)) {
+    printf("failed here\n");
     return res;
+  }
   if (foundGp && mDoneReadingHeaders) {
     // We've found a packet with a granulepos, and we've loaded our metadata
     // and initialized our decoder. Determine granulepos of buffered packets.
