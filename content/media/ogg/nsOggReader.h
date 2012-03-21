@@ -259,9 +259,7 @@ private:
   // Ogg decoding state.
   ogg_sync_state mOggState;
 
-
-  PRUint32 skippages;
-
+  int mChainKludgeState;
   // Vorbis/Theora data used to compute timestamps. This is written on the
   // decoder thread and read on the main thread. All reading on the main
   // thread must be done after metadataloaded. We can't use the existing
